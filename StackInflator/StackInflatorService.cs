@@ -38,7 +38,11 @@ public class StackInflatorService
             try
             {
                 var (procBytes, totalBytes) = GetProcessAndChildrenMemory(logger);
-                logger?.LogInformation("Inflated to {AllocatedMb} MB (proc={ProcMb} MB, proc+children={TotalMb} MB)", AllocatedMb, procBytes / 1024 / 1024, totalBytes / 1024 / 1024);
+                long containerBytes = GetContainerMemoryUsage(logger);
+                if (containerBytes >= 0)
+                    logger?.LogInformation("Inflated to {AllocatedMb} MB (proc={ProcMb} MB, proc+children={TotalMb} MB, container={ContainerMb} MB)", AllocatedMb, procBytes / 1024 / 1024, totalBytes / 1024 / 1024, containerBytes / 1024 / 1024);
+                else
+                    logger?.LogInformation("Inflated to {AllocatedMb} MB (proc={ProcMb} MB, proc+children={TotalMb} MB)", AllocatedMb, procBytes / 1024 / 1024, totalBytes / 1024 / 1024);
             }
             catch
             {
@@ -50,7 +54,11 @@ public class StackInflatorService
         try
         {
             var (procBytes, totalBytes) = GetProcessAndChildrenMemory(logger);
-            logger?.LogInformation("Inflation complete: {AllocatedMb} MB allocated (proc={ProcMb} MB, proc+children={TotalMb} MB)", AllocatedMb, procBytes / 1024 / 1024, totalBytes / 1024 / 1024);
+            long containerBytes = GetContainerMemoryUsage(logger);
+            if (containerBytes >= 0)
+                logger?.LogInformation("Inflation complete: {AllocatedMb} MB allocated (proc={ProcMb} MB, proc+children={TotalMb} MB, container={ContainerMb} MB)", AllocatedMb, procBytes / 1024 / 1024, totalBytes / 1024 / 1024, containerBytes / 1024 / 1024);
+            else
+                logger?.LogInformation("Inflation complete: {AllocatedMb} MB allocated (proc={ProcMb} MB, proc+children={TotalMb} MB)", AllocatedMb, procBytes / 1024 / 1024, totalBytes / 1024 / 1024);
         }
         catch
         {
@@ -255,5 +263,55 @@ public class StackInflatorService
 
         logger?.LogInformation("Reset allocation to 0 MB");
         GC.Collect();
+    }
+
+    private static long GetContainerMemoryUsage(ILogger? logger = null)
+    {
+        try
+        {
+            // cgroup v2
+            string[] candidates = new[] {
+                "/sys/fs/cgroup/memory.current",
+                "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+                "/sys/fs/cgroup/memory.usage_in_bytes",
+                "/sys/fs/cgroup/memory.stat"
+            };
+
+            foreach (var path in candidates)
+            {
+                try
+                {
+                    if (!File.Exists(path)) continue;
+                    var txt = File.ReadAllText(path);
+                    if (string.IsNullOrWhiteSpace(txt)) continue;
+
+                    // numeric file (memory.current or usage_in_bytes)
+                    if (long.TryParse(txt.Split('\n')[0].Trim(), out var v))
+                        return v;
+
+                    // memory.stat parsing: try to find a field that looks like an absolute bytes value (e.g., "anon <num>")
+                    var lines = txt.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var line in lines)
+                    {
+                        var parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                        if (parts.Length == 2 && long.TryParse(parts[1], out var num))
+                        {
+                            // memory.stat values are in bytes for cgroup v2; return a reasonable value (sum first few?)
+                            // prefer "anon" or "file" or "rss" keys
+                            if (parts[0].Contains("anon") || parts[0].Contains("rss") || parts[0].Contains("file"))
+                                return num;
+                        }
+                    }
+                }
+                catch (Exception ex) { logger?.LogDebug(ex, "Error reading cgroup path {Path}", path); }
+            }
+
+            return -1;
+        }
+        catch (Exception ex)
+        {
+            logger?.LogDebug(ex, "Failed to determine container memory usage");
+            return -1;
+        }
     }
 }
